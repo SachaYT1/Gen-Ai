@@ -40,19 +40,45 @@ def f1_score(prediction: str, gold_answers: List[str]) -> float:
     return best_f1
 
 
+def _sanitize_for_bertscore(texts: List[str]) -> List[str]:
+    """Replace empty / whitespace-only strings with a dot.
+
+    The ``bert_score`` library calls a deprecated tokenizer method
+    (``build_inputs_with_special_tokens``) for empty inputs, which
+    crashes on newer ``transformers`` versions.
+    """
+    return [t if t.strip() else "." for t in texts]
+
+
 def compute_bertscore(
     predictions: List[str], references: List[str]
 ) -> Dict[str, float]:
-    from bert_score import score as bert_score_fn
+    predictions = _sanitize_for_bertscore(predictions)
+    references = _sanitize_for_bertscore(references)
 
-    P, R, F1 = bert_score_fn(
-        predictions, references, lang="en", verbose=False
-    )
-    return {
-        "precision": P.mean().item(),
-        "recall": R.mean().item(),
-        "f1": F1.mean().item(),
-    }
+    try:
+        from bert_score import score as bert_score_fn
+
+        P, R, F1 = bert_score_fn(
+            predictions, references, lang="en", verbose=False
+        )
+        return {
+            "precision": P.mean().item(),
+            "recall": R.mean().item(),
+            "f1": F1.mean().item(),
+        }
+    except (AttributeError, TypeError):
+        import evaluate
+
+        metric = evaluate.load("bertscore")
+        results = metric.compute(
+            predictions=predictions, references=references, lang="en"
+        )
+        return {
+            "precision": sum(results["precision"]) / len(results["precision"]),
+            "recall": sum(results["recall"]) / len(results["recall"]),
+            "f1": sum(results["f1"]) / len(results["f1"]),
+        }
 
 
 def evaluate_all(
