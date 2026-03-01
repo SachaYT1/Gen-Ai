@@ -1,0 +1,11 @@
+torch
+transformers
+datasets
+accelerate
+sentencepiece
+evaluate
+bert-score
+pyserini
+pandas
+tqdm
+nltk
