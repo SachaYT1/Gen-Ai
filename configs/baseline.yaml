@@ -1,0 +1,28 @@
+seed: 42
+n_samples: 500
+
+datasets:
+  squad:
+    name: "squad"
+    split: "validation"
+  nq:
+    name: "nq_open"
+    split: "validation"
+
+models:
+  weak:
+    name: "google/flan-t5-base"
+    max_new_tokens: 64
+    batch_size: 16
+  strong:
+    name: "google/flan-t5-large"
+    max_new_tokens: 64
+    batch_size: 8
+
+retrieval:
+  method: "bm25"
+  index_name: "wikipedia-dpr"
+  top_k_large: 5
+  top_k_small: 1
+
+output_dir: "outputs/baseline"
