@@ -10,7 +10,7 @@ class BM25Retriever:
     def __init__(self, index_name: str = "wikipedia-dpr"):
         from pyserini.search.lucene import LuceneSearcher
 
-        self.searcher = LuceneSearcher.from_prebuilt_index(index_name)
+        self.searcher = LuceneSearcher("/root/.cache/pyserini/indexes/lucene-index.wikipedia-dpr-100w.20210120.d1b9e6")
 
     def retrieve(self, query: str, top_k: int = 5) -> List[Dict]:
         hits = self.searcher.search(query, k=top_k)
