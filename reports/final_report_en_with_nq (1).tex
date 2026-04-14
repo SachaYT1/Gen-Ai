@@ -1,0 +1,462 @@
+\documentclass[a4paper,12pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T2A,T1]{fontenc}
+\usepackage[english,russian]{babel}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\geometry{top=2cm, bottom=2cm, left=2.5cm, right=2.5cm}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+}
+\title{The Power of Context \\ Can a Smaller Model with Answer-Bearing Evidence Outperform a Stronger Model with Sparse Context?}
+\author{Ilya Maximov, Aleksandr Gavkovskii, Karim Zakriov \\ \texttt{GitHub: SachaYT1/Gen-Ai}}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This work investigates whether improving context quality at inference time can matter more than increasing model size for question answering. We compare Flan-T5-Base (250M) and Flan-T5-Large (780M) in a $2 \times 2$ factorial design across two regimes: a controlled setting on SQuAD~v1.1, where large context is the gold answer-bearing paragraph, and a retrieval-based setting on Natural Questions Open, where context is built from BM25-retrieved passages. Three prompt variants are evaluated using Exact Match, F1, BERTScore, answer-in-context rate, hallucination rate, and other diagnostics.
+
+On SQuAD, providing the full gold paragraph to the smaller model (EM~0.828) vastly outperforms giving the larger model only the first sentence (EM~0.296), showing that access to answer-bearing evidence dominates moderate model scaling. On Natural Questions, however, concatenating the top-5 retrieved passages collapses EM to near zero for both models, partly because the 512-token encoder limit truncates the question from the input. The main conclusion is that effective context for QA is not simply longer text, but compact, evidence-rich input with manageable retrieval noise.
+\end{abstract}
+
+\section{Introduction}
+In question answering tasks, it is commonly assumed that a larger model should provide better answers. However, in practice, a model can only answer on the basis of what is provided in the input, or what it already knows parametrically. In evidence-based QA, this is especially critical: if the answer is absent from the context, even a strong model becomes constrained.
+
+The goal of this project is to test the hypothesis that context quality and completeness can have a larger effect on QA metrics than increasing the number of model parameters. To do so, we construct a controlled pipeline in which only two factors are varied: the model and the context. This design allows us to compare the contribution of model scale and context richness fairly.
+
+We study two complementary regimes: the controlled SQuAD setting, where the large context is always answer-bearing, and the retrieval-based Natural Questions setting, where a larger context may contain more evidence but may also introduce distractors and retrieval noise. This comparison makes the main conclusion more precise: in QA, what matters is not merely more context, but context that is genuinely useful for the question.
+
+Our main contributions are: (1)~a clean $2 \times 2$ factorial comparison of model scale and context quality on two QA benchmarks with different context regimes; (2)~evidence that access to answer-bearing context dominates moderate model scaling in controlled QA; (3)~a diagnostic analysis showing that naive multi-passage concatenation can catastrophically degrade generation quality due to encoder truncation and retrieval noise; and (4)~a set of grounding-oriented metrics that distinguish evidence absence from model failure.
+
+\section{Related Work}
+
+\paragraph{Scaling laws and model size.}
+Kaplan et al.~\cite{scaling} established power-law scaling relationships between model size, data, and loss. Hoffmann et al.~\cite{chinchilla} refined these findings by showing that training compute should be allocated more evenly between parameters and tokens. Both works focus on training-time scaling; our study instead examines inference-time context as an alternative axis of improvement for a fixed model.
+
+\paragraph{Retrieval-augmented generation.}
+Lewis et al.~\cite{rag} introduced RAG, combining a parametric generator with a non-parametric retrieval component. Karpukhin et al.~\cite{dpr} proposed Dense Passage Retrieval, significantly outperforming BM25 on open-domain QA. Izacard and Grave~\cite{izacard} demonstrated that a Fusion-in-Decoder architecture can effectively leverage multiple retrieved passages. Our NQ experiments use BM25 as a deliberately simple retriever to isolate the effect of passage quantity from retrieval quality; the results suggest that even when recall improves with more passages, generation quality may still collapse.
+
+\paragraph{Long-context degradation.}
+Liu et al.~\cite{lost} showed that language models struggle to use information placed in the middle of long contexts, with a U-shaped attention pattern favoring the beginning and end of the input. This finding is directly relevant to our NQ results, where concatenating multiple passages pushes evidence into positions where the model is less likely to attend to it. In our case, the problem is compounded by the 512-token encoder limit of Flan-T5, which may truncate the question entirely when the context is long.
+
+\paragraph{Extractive and generative QA.}
+SQuAD~\cite{squad} established the standard for extractive reading comprehension, while Natural Questions~\cite{nq} introduced a more realistic open-domain setting. Our work bridges the two by comparing a controlled extractive regime (SQuAD with gold paragraphs) against a retrieval-based generative regime (NQ with BM25), using the same models and metrics in both.
+
+\section{Data, Models, and Experimental Pipeline}
+\subsection{Gold paragraph, small context, and large context}
+In the SQuAD dataset, each question is associated with a paragraph that is guaranteed to contain the correct answer. In this report, we refer to it as the gold paragraph. Two variants of the input context are constructed from it:
+\begin{itemize}
+    \item \textbf{small context} — only the first sentence of the gold paragraph;
+    \item \textbf{large context} — the entire gold paragraph.
+\end{itemize}
+This setup deliberately creates two fundamentally different situations. In the large context, the answer is always present, so the model’s task reduces to correct extraction or concise generation. In the small context, the answer is often absent: according to our measurements, the answer-in-context rate for small context is only 0.36, meaning that in 64\% of cases the answer is not shown to the model at all.
+
+For Natural Questions Open, the context is constructed differently. Here, the answer is not given together with the question and must first be found by the retrieval module:
+\begin{itemize}
+    \item \textbf{small context} — the top-1 retrieved passage;
+    \item \textbf{large context} — the concatenation of the top-5 retrieved passages.
+\end{itemize}
+Unlike SQuAD, the large context in NQ is not a gold context. It may truly increase answer coverage, but it may also introduce irrelevant passages and make the model’s job harder.
+
+\subsection{Data and models used}
+The main SQuAD analysis is conducted on 500 randomly selected examples from the validation split. For the open-domain setting, we additionally use a subset of 500 examples from Natural Questions Open. NQ is closer to realistic retrieval-augmented QA because context quality there is determined not by a gold paragraph, but by retrieval quality.
+
+Two models from the same family are used:
+\begin{center}
+\begin{tabular}{|l|l|c|}
+\hline
+Role & Model & Parameters \\
+\hline
+Weak & google/flan-t5-base & 250M \\
+Strong & google/flan-t5-large & 780M \\
+\hline
+\end{tabular}
+\end{center}
+This choice is important because the architecture remains the same while only the scale changes, making the comparison cleaner.
+
+\subsection{Experimental design and pipeline}
+We consider four conditions:
+\begin{center}
+\begin{tabular}{|l|l|l|}
+\hline
+Condition & Model & Context \\
+\hline
+weak\_small & Flan-T5-Base & small context \\
+weak\_large & Flan-T5-Base & large context \\
+strong\_small & Flan-T5-Large & small context \\
+strong\_large & Flan-T5-Large & large context \\
+\hline
+\end{tabular}
+\end{center}
+
+The pipeline consists of two steps:
+\begin{enumerate}
+    \item \textbf{Sample preparation.} The script \texttt{build\_samples.py} loads the dataset. For SQuAD, it extracts the first sentence from the gold paragraph and stores \texttt{context\_small} and \texttt{context\_large}. For NQ, it first runs BM25 retrieval over the Wikipedia DPR corpus, then builds top-1 and top-5 retrieval contexts.
+    \item \textbf{Inference and evaluation.} The script \texttt{run\_baseline.py} inserts the context and the question into the prompt template, runs the selected model, stores the predictions, and computes the metrics.
+\end{enumerate}
+This two-stage design makes the experiment reproducible: data preparation and model execution are separated, so samples can be cached, reused, and compared across prompt styles without repeating preprocessing.
+
+\section{Prompt templates: what exactly is fed to the model}
+\subsection{Instruction templates}
+In this work, an instruction is a string template that is passed to the model as input. Specific values of \texttt{context} and \texttt{question} are inserted into it. The actual prompt templates from the project code are shown below.
+
+\textbf{basic:}
+\begin{verbatim}
+Context: {context}
+Question: {question}
+Answer:
+\end{verbatim}
+
+\textbf{use\_only\_context:}
+\begin{verbatim}
+Answer the question using only the provided context.
+Give a short factual answer.
+
+Context: {context}
+Question: {question}
+Answer:
+\end{verbatim}
+
+\textbf{not\_found\_if\_missing:}
+\begin{verbatim}
+Answer the question using only the provided context.
+If the answer is not present in the context, answer exactly: not found
+
+Context: {context}
+Question: {question}
+Answer:
+\end{verbatim}
+
+\subsection{Example of a real prompt}
+For the question \textit{How might gravity effects be observed differently according to Newton?}, in the basic + small context setting, the model receives the following input:
+\begin{verbatim}
+Context: Newton came to realize that the effects of gravity might
+be observed in different ways at larger distances.
+Question: How might gravity effects be observed differently according to Newton?
+Answer:
+\end{verbatim}
+It is important that the instruction here is not an abstract idea but a literal textual prefix that affects model behavior. For example, \texttt{use\_only\_context} adds a strict requirement to rely only on the provided context, while \texttt{not\_found\_if\_missing} explicitly introduces an abstention mode.
+
+\section{Examples: when context helps and when retrieval hurts}
+\subsection{SQuAD: when small context hides the answer}
+A real SQuAD example is shown below.
+\begin{itemize}
+    \item \textbf{Question:} What is the prize offered for finding a solution to P = NP?
+    \item \textbf{Small context:} The question of whether P equals NP is one of the most important open questions in theoretical computer science because of the wide implications of a solution.
+    \item \textbf{Large context:} \ldots There is a US\$1,000,000 prize for resolving the problem.
+    \item \textbf{Gold answer:} US\$1,000,000
+\end{itemize}
+The model behavior for this example is illustrative:
+\begin{center}
+\begin{tabular}{|l|l|}
+\hline
+Configuration & Prediction \\
+\hline
+basic + weak\_small & unanswerable \\
+basic + weak\_large & US\$1,000,000 \\
+basic + strong\_small & unanswerable \\
+basic + strong\_large & US\$1,000,000 \\
+not\_found\_if\_missing + weak\_small & not found \\
+not\_found\_if\_missing + strong\_small & not found \\
+\hline
+\end{tabular}
+\end{center}
+This example shows that the problem of the short-context regime is not weak reasoning, but the fact that the answer is physically absent from the input.
+
+\subsection{SQuAD: prompt changes answer style}
+For the Newton-and-gravity question, all configurations with the standard basic prompt predict the short answer \textit{at larger distances}. However, under \texttt{use\_only\_context + strong\_large}, the model generates almost a full sentence: \textit{Newton came to realize that the effects of gravity might be observed in different ways at larger distances.} This answer is semantically close to the correct one, but it aligns worse with Exact Match. This is one of the key prompt-design effects in our experiment: the instruction changes not only factuality, but also answer format.
+
+\subsection{Natural Questions: retrieval noise breaks large context}
+The following example is illustrative for open-domain QA:
+\begin{itemize}
+    \item \textbf{Question:} where does the karate kid 2010 take place
+    \item \textbf{Gold answers:} China / Beijing / Beijing, China
+    \item \textbf{top-1 retrieval context:} already contains the phrase \textit{moves to Beijing, China with his mother}
+    \item \textbf{top-5 retrieval context:} adds several more passages about the franchise, film release, and related articles
+\end{itemize}
+Under the basic prompt, \texttt{weak\_small} and \texttt{strong\_small} predict \textit{Beijing, China}, whereas \texttt{weak\_large} and \texttt{strong\_large} answer \textit{Sony Pictures.} This example shows that in NQ, more context does not automatically mean better evidence: additional passages may pull the model toward irrelevant details.
+
+\section{Metrics}
+The final analysis uses the following metrics:
+\begin{itemize}
+    \item \textbf{Exact Match (EM)} — exact match between the normalized prediction and one of the gold answers.
+    \item \textbf{Token-level F1} — harmonic mean of token-level precision and recall.
+    \item \textbf{Token Precision / Token Recall} — a more detailed decomposition of F1.
+    \item \textbf{BERTScore Precision / Recall / F1} — semantic similarity between the prediction and the gold answer.
+    \item \textbf{Answer-in-context rate} — the fraction of examples in which the correct answer is actually present in the provided context.
+    \item \textbf{Prediction-in-context rate} — the fraction of predictions that can be found in the context.
+    \item \textbf{Hallucination rate} — the fraction of non-empty predictions where the normalized prediction is not a substring of the normalized context and Exact Match is zero. This is more precisely an \emph{unsupported answer rate}: it catches answers that cannot be traced back to the input text, but may overcount cases where the model produces a valid paraphrase that fails substring matching.
+    \item \textbf{Not-found rate} — the fraction of answers equal to \texttt{not found}.
+    \item \textbf{Average prediction length} — average answer length in tokens.
+    \item \textbf{Latency per sample} — average inference latency per example.
+\end{itemize}
+These metrics make it possible to distinguish between two different problems: the model failed to find the answer although it was present in the context, and the answer was absent from the provided context altogether. In NQ, there is also a third problem: retrieval may return a context that is partially relevant but poorly organized and full of distractors.
+
+\section{Quantitative Results on SQuAD}
+\subsection{Main results for the basic prompt}
+Table~\ref{tab:squad_basic} shows the main results for the basic prompt style. It clearly demonstrates that \texttt{weak\_large} (smaller model + full context) strongly outperforms \texttt{strong\_small} (larger model + poor context).
+
+\begin{table}[H]
+\centering
+\caption{Main SQuAD results for the basic prompt}
+\label{tab:squad_basic}
+\begin{tabular}{|l|c|c|c|c|c|c|}
+\hline
+Condition & EM & F1 & BERT-F1 & Ans-in-ctx & Pred-in-ctx & Halluc. \\
+\hline
+weak\_small & 0.282 & 0.334 & 0.898 & 0.360 & 0.748 & 0.242 \\
+weak\_large & 0.828 & 0.896 & 0.963 & 1.000 & 0.976 & 0.024 \\
+strong\_small & 0.296 & 0.338 & 0.895 & 0.360 & 0.616 & 0.370 \\
+strong\_large & 0.882 & 0.935 & 0.968 & 1.000 & 0.976 & 0.022 \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{SQuAD: answer length and latency}
+\begin{tabular}{|l|c|c|c|}
+\hline
+Condition & Avg. length & Latency/sample (s) & Inference time (s) \\
+\hline
+weak\_small & 2.254 & 0.270 & 135.24 \\
+weak\_large & 2.750 & 0.523 & 261.42 \\
+strong\_small & 2.128 & 0.600 & 300.08 \\
+strong\_large & 2.850 & 1.588 & 794.14 \\
+\hline
+\end{tabular}
+\end{table}
+
+The key comparison is:
+\begin{itemize}
+    \item moving from weak\_small to weak\_large yields +0.546 EM;
+    \item moving from weak\_small to strong\_small yields only +0.014 EM;
+    \item therefore, adding evidence matters more than increasing model size under poor-context conditions.
+\end{itemize}
+
+\subsection{Error type distribution}
+Table~\ref{tab:squad_errors} breaks down the 500 predictions per condition into diagnostic categories derived from automatic error classification. For small-context conditions, the dominant error type is \textit{answer absent in context}: 55.4\% for weak\_small and 56.6\% for strong\_small. This confirms that the performance gap is primarily driven by evidence availability, not model reasoning. For large-context conditions, both models achieve high exact-match rates, but 5--6\% of examples remain in the \textit{wrong answer despite answer in context} category, indicating residual extraction failures even when the evidence is present.
+
+\begin{table}[H]
+\centering
+\caption{SQuAD error type distribution for the basic prompt (fraction of 500 examples)}
+\label{tab:squad_errors}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+Error type & weak\_sm & weak\_lg & strong\_sm & strong\_lg \\
+\hline
+Correct exact     & 0.282 & 0.828 & 0.296 & 0.882 \\
+Partially correct & 0.120 & 0.114 & 0.096 & 0.090 \\
+Answer absent     & 0.554 & ---   & 0.566 & ---   \\
+Wrong despite present & 0.044 & 0.058 & 0.042 & 0.026 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Visual comparison across multiple metrics}
+Figure~\ref{fig:squad_basic_grid} presents six metrics for the basic prompt at once: EM, F1, BERT-F1, hallucination rate, prediction-in-context rate, and latency.
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{squad_basic_grid.png}
+\caption{SQuAD, 500 examples: comparison of four conditions for the basic prompt across six metrics.}
+\label{fig:squad_basic_grid}
+\end{figure}
+
+The figure shows that:
+\begin{itemize}
+    \item \texttt{weak\_large} and \texttt{strong\_large} strongly outperform short-context configurations in EM and F1;
+    \item \texttt{strong\_small} has a noticeably higher hallucination rate than \texttt{weak\_small};
+    \item the quality gain of \texttt{strong\_large} is accompanied by the highest latency.
+\end{itemize}
+
+\subsection{Effect of prompt style}
+Figure~\ref{fig:squad_prompt_compare} shows how three prompt variants change EM, F1, and hallucination rate.
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{squad_prompt_compare.png}
+\caption{SQuAD: effect of prompt style on EM, F1, and hallucination rate.}
+\label{fig:squad_prompt_compare}
+\end{figure}
+
+The most stable variant is \texttt{basic}. The \texttt{use\_only\_context} prompt slightly helps the weaker model under small context in terms of grounding, but strongly hurts \texttt{strong\_small}: EM drops to 0.122, F1 drops to 0.238, and the average answer length rises to 9.246 tokens. This suggests that the stricter instruction pushes the stronger model to paraphrase the context rather than extract a short answer.
+
+\section{Quantitative Results on Natural Questions Open}
+\subsection{Retrieval quality}
+Before answer generation, NQ requires building a retrieval context. Table~\ref{tab:nq_retrieval} shows that increasing the number of passages indeed raises the probability that the answer enters the input: answer-in-context rate grows from 0.276 at $k=1$ to 0.596 at $k=10$. However, this is not sufficient to guarantee an increase in EM/F1, because longer context also introduces distractors.
+
+\begin{table}[H]
+\centering
+\caption{Natural Questions: retrieval coverage}
+\label{tab:nq_retrieval}
+\begin{tabular}{|c|c|c|}
+\hline
+$k$ & Recall@$k$ & Answer-in-context@$k$ \\
+\hline
+1 & 0.276 & 0.276 \\
+3 & 0.442 & 0.442 \\
+5 & 0.488 & 0.488 \\
+10 & 0.596 & 0.596 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Main results for the basic prompt}
+Table~\ref{tab:nq_basic} shows that on NQ the picture is radically different from SQuAD. Under the basic prompt, the best conditions are the short-context ones: \texttt{strong\_small} reaches EM 0.160 and F1 0.230, while \texttt{weak\_small} reaches EM 0.148 and F1 0.216. By contrast, both large-context configurations collapse almost to zero in EM.
+\begin{table}[H]
+\centering
+\caption{Main NQ results for the basic prompt}
+\label{tab:nq_basic}
+\begin{tabular}{|l|c|c|c|c|c|c|}
+\hline
+Condition & EM & F1 & BERT-F1 & Ans-in-ctx & Pred-in-ctx & Halluc. \\
+\hline
+weak\_small & 0.148 & 0.216 & 0.887 & 0.276 & 0.910 & 0.062 \\
+weak\_large & 0.002 & 0.029 & 0.837 & 0.488 & 0.698 & 0.302 \\
+strong\_small & 0.160 & 0.230 & 0.891 & 0.276 & 0.838 & 0.092 \\
+strong\_large & 0.008 & 0.032 & 0.835 & 0.488 & 0.536 & 0.464 \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{NQ: answer length and latency}
+\begin{tabular}{|l|c|c|c|}
+\hline
+Condition & Avg. length & Latency/sample (s) & Inference time (s) \\
+\hline
+weak\_small & 2.704 & 0.304 & 152.13 \\
+weak\_large & 10.558 & 0.799 & 399.72 \\
+strong\_small & 2.610 & 0.866 & 432.81 \\
+strong\_large & 11.574 & 2.699 & 1349.32 \\
+\hline
+\end{tabular}
+\end{table}
+
+On NQ, the key comparison must be stated differently than on SQuAD:
+\begin{itemize}
+    \item moving from weak\_small to weak\_large does not help, but sharply hurts quality;
+    \item moving from strong\_small to strong\_large also nearly zeros out EM/F1;
+    \item therefore, in retrieval-based QA, more retrieved text does not necessarily mean better context.
+\end{itemize}
+
+\subsection{Visual comparison across multiple metrics}
+Figure~\ref{fig:nq_basic_grid} shows EM, F1, BERT-F1, hallucination rate, prediction-in-context rate, and latency for NQ under the basic prompt.
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{nq_basic_grid.png}
+\caption{Natural Questions Open, 500 examples: comparison of four conditions for the basic prompt across six metrics.}
+\label{fig:nq_basic_grid}
+\end{figure}
+
+The main contrast with SQuAD is that the large-context configurations not only fail to improve quality, but also produce longer answers, higher hallucination rates, and lower extractability of predictions from the context.
+
+\subsection{Effect of prompt style}
+Figure~\ref{fig:nq_prompt_compare} shows how the three prompt styles change EM, F1, and hallucination rate on NQ.
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{nq_prompt_compare.png}
+\caption{Natural Questions Open: effect of prompt style on EM, F1, and hallucination rate.}
+\label{fig:nq_prompt_compare}
+\end{figure}
+
+The picture here is even harsher than on SQuAD. For large-context regimes, prompt engineering does not rescue quality. Stricter instructions reduce some unsupported answers in selected conditions, but at the same time they increase the tendency toward long answers with poor overlap with the gold answer. The \texttt{not\_found\_if\_missing} prompt activates abstention and sharply increases \texttt{not-found rate}, but does not improve EM/F1.
+
+\section{Analysis and Interpretation}
+\subsection{What makes context “good”}
+The comparison between SQuAD and NQ shows that good context is not simply long text. Good context is context that contains a relevant answer span and helps the model isolate it without being overwhelmed by distractors. On SQuAD, large context is exactly that: it is the gold paragraph, where answer-bearing evidence is guaranteed to be present. On NQ, large context is merely a concatenation of retrieved passages, among which some may be useful and some irrelevant.
+
+That is why simply saying that “context matters” is not enough. A more precise formulation is this: for evidence-based QA, the decisive factor is the presence of answer-bearing evidence in the input under an acceptable level of retrieval noise.
+
+\subsection{Why SQuAD and NQ behave differently}
+On SQuAD, adding context helps because we move from an artificially truncated first sentence to the full gold paragraph. On NQ, adding context is implemented differently: the model receives more retrieved passages, but these passages do not guarantee quality. As a result, answer-in-context rate indeed rises from 0.276 to 0.488 for top-5, while EM/F1 simultaneously collapse almost to zero. This means that the mere presence of the answer somewhere in the concatenated context does not guarantee that the model will extract it correctly.
+
+\subsection{Why large context degrades on NQ: the truncation effect}
+The most important technical explanation for the NQ collapse is \textbf{encoder-side truncation}. Flan-T5 uses a T5-style encoder--decoder architecture with a maximum encoder input length of 512 tokens. In our pipeline, the tokenizer truncates any input exceeding this limit. For the basic prompt, the input format is:
+\begin{verbatim}
+Context: {context}\nQuestion: {question}\nAnswer:
+\end{verbatim}
+When the context consists of five concatenated retrieved passages, the total input can easily reach 600--1500 tokens. With truncation at 512 tokens, the tail of the input — which contains the \textit{question} and the \texttt{Answer:} cue — is silently removed. The model then receives a block of context text with no question to answer, which explains both the near-zero EM and the tendency to produce long, irrelevant outputs.
+
+Beyond truncation, several additional factors contribute:
+\begin{itemize}
+    \item retrieved passages contain distractors, near-duplicates, and off-topic text;
+    \item even when the answer is present somewhere in the concatenation, it may appear in a position that is hard for the model to attend to~\cite{lost};
+    \item the model copies irrelevant spans, producing long answers (avg.\ 10--12 tokens) with poor overlap with the gold answer.
+\end{itemize}
+
+\subsection{Side-by-side comparison: SQuAD vs.\ Natural Questions}
+Table~\ref{tab:side_by_side} highlights the contrast between the two regimes under the basic prompt. On SQuAD, adding context yields a massive quality gain; on NQ, it causes a collapse. The answer-in-context rate rises in both cases, but only on SQuAD does this translate into higher EM/F1.
+
+\begin{table}[H]
+\centering
+\caption{SQuAD vs.\ NQ under the basic prompt: the same experimental design produces opposite outcomes depending on context quality}
+\label{tab:side_by_side}
+\begin{tabular}{|l|cc|cc|}
+\hline
+& \multicolumn{2}{c|}{SQuAD} & \multicolumn{2}{c|}{NQ} \\
+Metric & weak\_sm & weak\_lg & weak\_sm & weak\_lg \\
+\hline
+EM              & 0.282 & 0.828 & 0.148 & 0.002 \\
+F1              & 0.334 & 0.896 & 0.216 & 0.029 \\
+BERT-F1         & 0.898 & 0.963 & 0.887 & 0.837 \\
+Ans-in-ctx      & 0.360 & 1.000 & 0.276 & 0.488 \\
+Halluc.\ rate   & 0.242 & 0.024 & 0.062 & 0.302 \\
+Avg.\ length    & 2.25  & 2.75  & 2.70  & 10.56 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Interpreting BERTScore in the context of QA}
+Across all conditions, BERTScore F1 remains relatively high (0.83--0.97), even when EM and token F1 are near zero. This apparent contradiction arises because BERTScore measures semantic similarity at the embedding level: a long generated answer that is topically related to the gold answer can still receive a high BERTScore despite containing none of the correct tokens. For short-answer QA, EM and token-level F1 are therefore more reliable indicators of answer correctness, and BERTScore should be interpreted as a soft \emph{topical relevance} measure rather than an accuracy metric. This is particularly evident on NQ, where \texttt{weak\_large} achieves BERT-F1 of 0.837 but EM of only 0.002.
+
+\subsection{Why basic remains the most stable prompt}
+Across both datasets, \texttt{basic} remains the most stable variant. Stricter instructions are only useful in special cases: they may reduce some unsupported answers or activate abstention. On average, however, they align worse with extractive-style evaluation because they push the model toward long paraphrase-like answers or toward excessive use of \texttt{not found}.
+
+\section{Limitations and Future Work}
+The project has the following limitations.
+\begin{enumerate}
+    \item \textbf{Encoder truncation.} Flan-T5 truncates encoder inputs at 512 tokens. For NQ large-context conditions, this means the question and answer cue are likely removed from the input, making the NQ collapse partly an artifact of the input length limit rather than a pure retrieval-quality effect. Future work should either increase the input budget (e.g., LongT5) or explicitly measure truncation rates.
+    \item \textbf{Single seed, no confidence intervals.} All results are based on a single random sample of 500 examples (seed 42) with no bootstrap confidence intervals or significance tests. In particular, the small difference between \texttt{weak\_small} and \texttt{strong\_small} ($+0.014$ EM) may not be statistically significant.
+    \item \textbf{Simple retrieval pipeline.} The NQ analysis uses BM25 with naive top-$k$ concatenation, without reranking, deduplication, or passage ordering. Stronger retrievers or reranking may change the picture substantially.
+    \item \textbf{Strict SQuAD ablation.} The small-context setting (first sentence only) is a very strict ablation that makes the SQuAD result visually dramatic but somewhat expected: the answer is physically absent in 64\% of cases. This is useful for isolating the evidence-availability factor but is not fully equivalent to a realistic RAG system.
+    \item \textbf{No calibration evaluation.} Whether the model is ``confident or not'' is assessed only indirectly through not-found rate, prediction-in-context rate, and hallucination rate rather than through probabilistic calibration measures.
+\end{enumerate}
+A natural next step is to study reranking, alternative retrieval depths, and passage-aware input formatting that respects the model's context window. It would also be valuable to compare top-1, top-3, top-5, and top-10 not only by recall, but also by final QA quality after generation, and to repeat the analysis with multiple random seeds and bootstrap confidence intervals.
+
+\section{Conclusion}
+In this work, we investigated whether a smaller model with answer-bearing context can outperform a stronger model with sparse context. On SQuAD, the answer is clearly positive: \texttt{weak\_large} (EM~0.828) vastly outperforms \texttt{strong\_small} (EM~0.296), and the gain from providing the full gold paragraph ($+0.546$ EM) is roughly 39 times larger than the gain from switching to a larger model under small-context conditions ($+0.014$ EM).
+
+However, the Natural Questions experiments show that this result does not generalize to arbitrary context expansion. In retrieval-based QA, concatenating more passages raises answer-in-context rate (from 0.276 to 0.488) but simultaneously collapses EM/F1 to near zero. We identified two key causes: (1)~the 512-token encoder limit of Flan-T5 truncates the question from the input when the context is long, and (2)~additional retrieved passages introduce distractors and noise that overwhelm the generator.
+
+The main conclusion is that effective context for evidence-based QA should be understood not as longer text, but as \emph{compact, answer-bearing input} with manageable retrieval noise and within the model's processing capacity. Context quality, not context quantity, is what drives QA performance.
+
+\section*{Individual Contributions}
+\textbf{Karim Zakriov} implemented dataset preprocessing and the retrieval pipeline (BM25 over Wikipedia DPR); constructed SQuAD and NQ context variants; executed the full benchmark matrix across all conditions and prompt styles and produced raw experimental outputs.
+\textbf{Ilya Maximov} designed prompt templates and the evaluation metrics module; performed quantitative and qualitative result analysis; wrote the report and formulated the main conclusions.
+\textbf{Aleksandr Gavkovskii} implemented the model inference framework with batching, device selection, and caching; built experiment logging and output utilities; assembled the final reproducible repository with Docker support.
+All authors jointly defined the research question, discussed the experimental design, and contributed to the interpretation of results.
+
+\begin{thebibliography}{10}
+\bibitem{squad} Pranav Rajpurkar, Jian Zhang, Konstantin Lopyrev, and Percy Liang. SQuAD: 100,000+ Questions for Machine Comprehension of Text. In \textit{Proceedings of EMNLP}, 2016.
+\bibitem{nq} Tom Kwiatkowski et al. Natural Questions: A Benchmark for Question Answering Research. \textit{Transactions of the Association for Computational Linguistics}, 2019.
+\bibitem{dpr} Vladimir Karpukhin et al. Dense Passage Retrieval for Open-Domain Question Answering. In \textit{Proceedings of EMNLP}, 2020.
+\bibitem{flan} Hyung Won Chung et al. Scaling Instruction-Finetuned Language Models. \textit{arXiv preprint arXiv:2210.11416}, 2022.
+\bibitem{bertscore} Tianyi Zhang, Varsha Kishore, Felix Wu, Kilian Q. Weinberger, and Yoav Artzi. BERTScore: Evaluating Text Generation with BERT. In \textit{Proceedings of ICLR}, 2020.
+\bibitem{lost} Nelson F. Liu et al. Lost in the Middle: How Language Models Use Long Contexts. \textit{arXiv preprint arXiv:2307.03172}, 2023.
+\bibitem{scaling} Jared Kaplan et al. Scaling Laws for Neural Language Models. \textit{arXiv preprint arXiv:2001.08361}, 2020.
+\bibitem{chinchilla} Jordan Hoffmann et al. Training Compute-Optimal Large Language Models. \textit{arXiv preprint arXiv:2203.15556}, 2022.
+\bibitem{rag} Patrick Lewis et al. Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks. In \textit{Advances in Neural Information Processing Systems}, 2020.
+\bibitem{izacard} Gautier Izacard and Edouard Grave. Leveraging Passage Retrieval with Generative Models for Open Domain Question Answering. In \textit{Proceedings of EACL}, 2021.
+\end{thebibliography}
+
+\end{document}
