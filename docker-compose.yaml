@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  squad:
+    build: .
+    working_dir: /src
+    volumes:
+      - ./:/src
+      - hf_cache:/root/.cache/huggingface
+      - pip_cache:/root/.cache/pip
+    command: bash scripts/run_squad.sh
+
+  nq:
+    build: .
+    working_dir: /src
+    volumes:
+      - ./:/src
+      - hf_cache:/root/.cache/huggingface
+      - pip_cache:/root/.cache/pip
+      - ./data/pyserini:/root/.cache/pyserini
+    command: bash scripts/run_nq.sh
+
+volumes:
+  hf_cache:
+  pip_cache:
+  pyserini_cache:
