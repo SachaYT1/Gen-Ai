@@ -6,7 +6,6 @@ venv/
 *.egg-info/
 dist/
 build/
-outputs/
 .DS_Store
 *.swp
 *.swo
