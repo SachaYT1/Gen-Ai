@@ -70,7 +70,7 @@ Unlike SQuAD, the large context in NQ is not a gold context. It may truly increa
 \subsection{Data and models used}
 The main SQuAD analysis is conducted on 500 randomly selected examples from the validation split. For the open-domain setting, we additionally use a subset of 500 examples from Natural Questions Open. NQ is closer to realistic retrieval-augmented QA because context quality there is determined not by a gold paragraph, but by retrieval quality.
 
-Two models from the same family are used:
+Two models from the Flan-T5 family~\cite{flan} are used:
 \begin{center}
 \begin{tabular}{|l|l|c|}
 \hline
@@ -191,7 +191,7 @@ The final analysis uses the following metrics:
     \item \textbf{Exact Match (EM)} — exact match between the normalized prediction and one of the gold answers.
     \item \textbf{Token-level F1} — harmonic mean of token-level precision and recall.
     \item \textbf{Token Precision / Token Recall} — a more detailed decomposition of F1.
-    \item \textbf{BERTScore Precision / Recall / F1} — semantic similarity between the prediction and the gold answer.
+    \item \textbf{BERTScore Precision / Recall / F1}~\cite{bertscore} — semantic similarity between the prediction and the gold answer.
     \item \textbf{Answer-in-context rate} — the fraction of examples in which the correct answer is actually present in the provided context.
     \item \textbf{Prediction-in-context rate} — the fraction of predictions that can be found in the context.
     \item \textbf{Hallucination rate} — the fraction of non-empty predictions where the normalized prediction is not a substring of the normalized context and Exact Match is zero. This is more precisely an \emph{unsupported answer rate}: it catches answers that cannot be traced back to the input text, but may overcount cases where the model produces a valid paraphrase that fails substring matching.
@@ -385,7 +385,9 @@ The most important technical explanation for the NQ collapse is \textbf{encoder-
 \begin{verbatim}
 Context: {context}\nQuestion: {question}\nAnswer:
 \end{verbatim}
-When the context consists of five concatenated retrieved passages, the total input can easily reach 600--1500 tokens. With truncation at 512 tokens, the tail of the input — which contains the \textit{question} and the \texttt{Answer:} cue — is silently removed. The model then receives a block of context text with no question to answer, which explains both the near-zero EM and the tendency to produce long, irrelevant outputs.
+When the context consists of five concatenated retrieved passages, the total input reaches 600--730 tokens on average (we measured a mean of ${\sim}518$ words, or ${\sim}673$ tokens at typical T5 tokenization rates). In fact, all 500 NQ large-context samples exceed the 512-token limit. With truncation, the tail of the input — which contains the \textit{question} and the \texttt{Answer:} cue — is silently removed. The model then receives a block of context text with no question to answer, which explains both the near-zero EM and the tendency to produce long, irrelevant outputs.
+
+The error analysis confirms this: under the basic prompt, 40\% of NQ large-context predictions (200 out of 500) fall into the category \textit{wrong answer despite answer in context}, meaning the gold answer was present in the retrieved text but the model still failed to extract it. This is consistent with truncation removing the question: the model has the evidence but no instruction for what to do with it.
 
 Beyond truncation, several additional factors contribute:
 \begin{itemize}
