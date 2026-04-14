@@ -13,45 +13,32 @@ Innopolis University — Generative AI course project
 | Requirement | Notes |
 |---|---|
 | **Python 3.10+** | Tested on 3.10 – 3.12 |
-| **Java 11+** | Required only for NQ retrieval (Pyserini/Lucene). Not needed for SQuAD. |
 
-**Install Java (only needed for NQ dataset):**
-
-```bash
-# macOS
-brew install openjdk@21
-
-# Ubuntu / Debian
-sudo apt install openjdk-21-jdk
-```
-
-### 2. Create environment and install dependencies
+### 2. Build containers
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+docker compose build
 ```
-
-### 3. Run the SQuAD baseline (no Java needed)
+### 3. Run SQuAD baseline
 
 ```bash
-# Step 1 — download SQuAD and prepare samples (large/small contexts)
-python -m src.experiments.build_samples --config configs/baseline.yaml --dataset squad
-
-# Step 2 — run inference (Flan-T5-Base vs Flan-T5-Large) and evaluate
-python -m src.experiments.run_baseline --config configs/baseline.yaml --dataset squad
+docker compose run --rm squad
 ```
 
-### 4. Run the NQ baseline (requires Java + ~7 GB for BM25 index)
+### 4. Run NQ baseline
+
+First, download and prepare the index:
 
 ```bash
-# Step 1 — download NQ, build BM25 index, retrieve passages
-python -m src.experiments.build_samples --config configs/baseline.yaml --dataset nq
-
-# Step 2 — run inference and evaluate
-python -m src.experiments.run_baseline --config configs/baseline.yaml --dataset nq
+./scripts/index.sh
 ```
+
+Then run:
+
+```bash
+docker compose run --rm nq
+```
+
 
 ---
 
